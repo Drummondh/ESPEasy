@@ -1,10 +1,20 @@
+#include "src/Globals/Device.h"
+
+#include "src/DataStructs/TimingStats.h"
+
+#include "define_plugin_sets.h"
+
+
+
 //********************************************************************************
 // Initialize all plugins that where defined earlier
 // and initialize the function call pointer into the plugin array
 //********************************************************************************
+#include <algorithm>
+static const char ADDPLUGIN_ERROR[] PROGMEM = "System: Error - Too many Plugins";
 
-static const char ADDPLUGIN_ERROR[] PROGMEM = "System: Error - To much Plugins";
-
+// Because of compiler-bug (multiline defines gives an error if file ending is CRLF) the define is striped to a single line
+/*
 #define ADDPLUGIN(NNN) \
   if (x < PLUGIN_MAX) \
   { \
@@ -13,20 +23,24 @@ static const char ADDPLUGIN_ERROR[] PROGMEM = "System: Error - To much Plugins";
   } \
   else \
     addLog(LOG_LEVEL_ERROR, FPSTR(ADDPLUGIN_ERROR));
+*/
+#define ADDPLUGIN(NNN) if (x < PLUGIN_MAX) { Plugin_id[x] = PLUGIN_ID_##NNN; Plugin_ptr[x++] = &Plugin_##NNN; } else addLog(LOG_LEVEL_ERROR, FPSTR(ADDPLUGIN_ERROR));
 
 
 void PluginInit(void)
 {
-  byte x;
-
   // Clear pointer table for all plugins
-  for (x = 0; x < PLUGIN_MAX; x++)
+  for (byte x = 0; x < PLUGIN_MAX; x++)
   {
     Plugin_ptr[x] = 0;
     Plugin_id[x] = 0;
   }
-
-  x = 0;
+  // Clear the cache.
+  for (byte x = 0; x < TASKS_MAX; x++)
+  {
+    Task_id_to_Plugin_id[x] = -1;
+  }
+  int x = 0; // Used in ADDPLUGIN macro
 
 #ifdef PLUGIN_001
   ADDPLUGIN(001)
@@ -1048,9 +1062,23 @@ void PluginInit(void)
   ADDPLUGIN(255)
 #endif
 
-  PluginCall(PLUGIN_DEVICE_ADD, 0, dummyString);
-  PluginCall(PLUGIN_INIT_ALL, 0, dummyString);
+  String dummy;
+  PluginCall(PLUGIN_DEVICE_ADD, 0, dummy);
+  PluginCall(PLUGIN_INIT_ALL, 0, dummy);
 
+}
+
+
+
+int8_t getXFromPluginId(byte pluginID) {
+  std::vector<byte>::iterator it;
+  int8_t returnValue = -1;
+
+  it = find(Plugin_id.begin(), Plugin_id.end(), pluginID);
+  if (it != Plugin_id.end())
+    returnValue = std::distance(Plugin_id.begin(),it);
+
+  return returnValue;
 }
 
 
@@ -1059,28 +1087,99 @@ void PluginInit(void)
 \*********************************************************************************************/
 byte PluginCall(byte Function, struct EventStruct *event, String& str)
 {
-  int x;
   struct EventStruct TempEvent;
-
   if (event == 0)
     event = &TempEvent;
+  else
+    TempEvent = (*event);
 
+
+  checkRAM(F("PluginCall"), Function);
   switch (Function)
   {
     // Unconditional calls to all plugins
     case PLUGIN_DEVICE_ADD:
-      for (x = 0; x < PLUGIN_MAX; x++)
-        if (Plugin_id[x] != 0)
+    case PLUGIN_UNCONDITIONAL_POLL:
+      for (byte x = 0; x < PLUGIN_MAX; x++) {
+        if (Plugin_id[x] != 0){
+          if (Function == PLUGIN_DEVICE_ADD) {
+            const unsigned int next_DeviceIndex = deviceCount + 2;
+            if (next_DeviceIndex > Device.size()) {
+              // Increase with 16 to get some compromise between number of resizes and wasted space
+              unsigned int newSize = Device.size();
+              newSize = newSize + 16 - (newSize % 16);
+              Device.resize(newSize);
+            }
+          }
+          START_TIMER;
           Plugin_ptr[x](Function, event, str);
+          STOP_TIMER_TASK(x,Function);
+          delay(0); // SMY: call delay(0) unconditionally
+        }
+      }
       return true;
-      break;
+
+      case PLUGIN_MONITOR:
+        for (auto it=globalMapPortStatus.begin(); it!=globalMapPortStatus.end(); ++it) {
+          //only call monitor function if there the need to
+          if (it->second.monitor || it->second.command || it->second.init) {
+            TempEvent.Par1 = getPortFromKey(it->first);;
+            //initialize the "x" variable to synch with the pluginNumber if second.x == -1
+            if (it->second.x == -1) it->second.x = getXFromPluginId((byte) getPluginFromKey(it->first));
+
+            if (it->second.x != -1)  {
+              const byte x = (byte) it->second.x;
+              if (Plugin_id[x] != 0){
+                START_TIMER;
+                Plugin_ptr[x](Function, &TempEvent, str);
+                STOP_TIMER_TASK(x,Function);
+              }
+            }
+          }
+        }
+        return true;
+
 
     // Call to all plugins. Return at first match
     case PLUGIN_WRITE:
-      for (x = 0; x < PLUGIN_MAX; x++)
-        if (Plugin_id[x] != 0)
-          if (Plugin_ptr[x](Function, event, str))
-            return true;
+    case PLUGIN_REQUEST:
+      {
+        for (byte y = 0; y < TASKS_MAX; y++)
+        {
+          if (Settings.TaskDeviceEnabled[y] && Settings.TaskDeviceNumber[y] != 0)
+          {
+            if (Settings.TaskDeviceDataFeed[y] == 0) // these calls only to tasks with local feed
+            {
+              const int x = getPluginId_from_TaskIndex(y);
+              if (x >= 0) {
+                byte DeviceIndex = getDeviceIndex(Settings.TaskDeviceNumber[y]);
+                TempEvent.TaskIndex = y;
+                TempEvent.BaseVarIndex = y * VARS_PER_TASK;
+                TempEvent.sensorType = Device[DeviceIndex].VType;
+                checkRAM(F("PluginCall_s"),x);
+                START_TIMER;
+                bool retval = (Plugin_ptr[x](Function, &TempEvent, str));
+                STOP_TIMER_TASK(x,Function);
+                delay(0); // SMY: call delay(0) unconditionally
+                if (retval) {
+                  CPluginCall(CPLUGIN_ACKNOWLEDGE, &TempEvent, str);
+                  return true;
+                }
+              }
+            }
+          }
+        }
+        // @FIXME TD-er: work-around as long as gpio command is still performed in P001_switch.
+        for (byte x = 0; x < PLUGIN_MAX; x++) {
+          if (Plugin_id[x] != 0) {
+            if (Plugin_ptr[x](Function, event, str)) {
+              delay(0); // SMY: call delay(0) unconditionally
+              CPluginCall(CPLUGIN_ACKNOWLEDGE, event, str);
+              return true;
+            }
+          }
+        }
+      }
       break;
 
     // Call to all plugins used in a task. Return at first match
@@ -1091,17 +1190,20 @@ byte PluginCall(byte Function, struct EventStruct *event, String& str)
         {
           if (Settings.TaskDeviceEnabled[y] && Settings.TaskDeviceNumber[y] != 0)
           {
-            for (x = 0; x < PLUGIN_MAX; x++)
-            {
-              if (Plugin_id[x] == Settings.TaskDeviceNumber[y])
-              {
-                byte DeviceIndex = getDeviceIndex(Settings.TaskDeviceNumber[y]);
-                TempEvent.TaskIndex = y;
-                TempEvent.BaseVarIndex = y * VARS_PER_TASK;
-                //TempEvent.idx = Settings.TaskDeviceID[y]; todo check
-                TempEvent.sensorType = Device[DeviceIndex].VType;
-                if (Plugin_ptr[x](Function, event, str))
-                  return true;
+            const int x = getPluginId_from_TaskIndex(y);
+            if (x >= 0) {
+              byte DeviceIndex = getDeviceIndex(Settings.TaskDeviceNumber[y]);
+              TempEvent.TaskIndex = y;
+              TempEvent.BaseVarIndex = y * VARS_PER_TASK;
+              //TempEvent.idx = Settings.TaskDeviceID[y]; todo check
+              TempEvent.sensorType = Device[DeviceIndex].VType;
+              START_TIMER;
+              bool retval =  (Plugin_ptr[x](Function, &TempEvent, str));
+              STOP_TIMER_TASK(x,Function);
+              delay(0); // SMY: call delay(0) unconditionally
+              if (retval){
+                checkRAM(F("PluginCallUDP"),x);
+                return true;
               }
             }
           }
@@ -1117,6 +1219,7 @@ byte PluginCall(byte Function, struct EventStruct *event, String& str)
     case PLUGIN_INIT_ALL:
     case PLUGIN_CLOCK_IN:
     case PLUGIN_EVENT_OUT:
+    case PLUGIN_TIME_CHANGE:
       {
         if (Function == PLUGIN_INIT_ALL)
           Function = PLUGIN_INIT;
@@ -1126,18 +1229,23 @@ byte PluginCall(byte Function, struct EventStruct *event, String& str)
           {
             if (Settings.TaskDeviceDataFeed[y] == 0) // these calls only to tasks with local feed
             {
-              byte DeviceIndex = getDeviceIndex(Settings.TaskDeviceNumber[y]);
-              TempEvent.TaskIndex = y;
-              TempEvent.BaseVarIndex = y * VARS_PER_TASK;
-              //TempEvent.idx = Settings.TaskDeviceID[y]; todo check
-              TempEvent.sensorType = Device[DeviceIndex].VType;
-              TempEvent.OriginTaskIndex = event->TaskIndex;
-              for (x = 0; x < PLUGIN_MAX; x++)
-              {
-                if (Plugin_id[x] == Settings.TaskDeviceNumber[y])
-                {
-                  Plugin_ptr[x](Function, &TempEvent, str);
+              const int x = getPluginId_from_TaskIndex(y);
+              if (x >= 0) {
+                byte DeviceIndex = getDeviceIndex(Settings.TaskDeviceNumber[y]);
+                TempEvent.TaskIndex = y;
+                TempEvent.BaseVarIndex = y * VARS_PER_TASK;
+                //TempEvent.idx = Settings.TaskDeviceID[y]; todo check
+                TempEvent.sensorType = Device[DeviceIndex].VType;
+                TempEvent.OriginTaskIndex = event->TaskIndex;
+                checkRAM(F("PluginCall_s"),x);
+                if (Function == PLUGIN_INIT) {
+                  // Schedule the plugin to be read.
+                  schedule_task_device_timer_at_init(TempEvent.TaskIndex);
                 }
+                START_TIMER;
+                Plugin_ptr[x](Function, &TempEvent, str);
+                STOP_TIMER_TASK(x,Function);
+                delay(0); // SMY: call delay(0) unconditionally
               }
             }
           }
@@ -1148,23 +1256,54 @@ byte PluginCall(byte Function, struct EventStruct *event, String& str)
 
     // Call to specific plugin that is used for current task
     case PLUGIN_INIT:
+    case PLUGIN_EXIT:
     case PLUGIN_WEBFORM_LOAD:
     case PLUGIN_WEBFORM_SAVE:
     case PLUGIN_WEBFORM_SHOW_VALUES:
     case PLUGIN_WEBFORM_SHOW_CONFIG:
     case PLUGIN_GET_DEVICEVALUENAMES:
+    case PLUGIN_GET_DEVICEGPIONAMES:
     case PLUGIN_READ:
-    case PLUGIN_REMOTE_CONFIG:
-      for (x = 0; x < PLUGIN_MAX; x++)
-      {
-        if ((Plugin_id[x] != 0 ) && (Plugin_id[x] == Settings.TaskDeviceNumber[event->TaskIndex]))
-        {
+    case PLUGIN_SET_CONFIG:
+    case PLUGIN_GET_CONFIG:
+    case PLUGIN_GET_PACKED_RAW_DATA:
+    case PLUGIN_SET_DEFAULTS:
+    {
+      const int x = getPluginId_from_TaskIndex(event->TaskIndex);
+      if (x >= 0) {
+        if (Plugin_id[x] != 0 ) {
+          if (Function == PLUGIN_INIT) {
+            // Schedule the plugin to be read.
+            schedule_task_device_timer_at_init(event->TaskIndex);
+          }
+          if (ExtraTaskSettings.TaskIndex != event->TaskIndex) {
+            // LoadTaskSettings may call PLUGIN_GET_DEVICEVALUENAMES.
+            LoadTaskSettings(event->TaskIndex);
+          }
           event->BaseVarIndex = event->TaskIndex * VARS_PER_TASK;
-          return Plugin_ptr[x](Function, event, str);
+          {
+            String descr = F("PluginCall_task_");
+            descr += event->TaskIndex;
+            checkRAM(descr, String(Function));
+          }
+          START_TIMER;
+          bool retval =  Plugin_ptr[x](Function, event, str);
+          if (retval && Function == PLUGIN_READ) {
+            saveUserVarToRTC();
+          }
+          if (Function == PLUGIN_GET_DEVICEVALUENAMES) {
+            ExtraTaskSettings.TaskIndex = event->TaskIndex;
+          }
+          if (Function == PLUGIN_EXIT) {
+            clearPluginTaskData(event->TaskIndex);
+          }
+          STOP_TIMER_TASK(x,Function);
+          delay(0); // SMY: call delay(0) unconditionally
+          return retval;
         }
       }
       return false;
-      break;
+    }
 
   }// case
   return false;
